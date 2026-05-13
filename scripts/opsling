@@ -1,0 +1,206 @@
+#!/usr/bin/env sh
+# ---------------------------------------------------------------
+# opsling — helper CLI for managing the Opsling service
+#
+# Thin sugar over `docker compose -f <opsling-dir>/docker-compose.yml`.
+# Install dir is auto-detected; override with OPSLING_DIR=/path/elsewhere.
+# ---------------------------------------------------------------
+set -eu
+
+OPSLING_HEALTH_URL="${OPSLING_HEALTH_URL:-http://127.0.0.1:4717/health}"
+
+# Auto-detect install dir if not set: prefer the user's home install, then
+# the system-wide /opt install. Same priority as a $HOME/.local/bin > /usr/local/bin
+# PATH layout — the user's own install wins if both exist.
+if [ -z "${OPSLING_DIR:-}" ]; then
+  if [ -n "${HOME:-}" ] && [ -f "$HOME/.opsling/docker-compose.yml" ]; then
+    OPSLING_DIR="$HOME/.opsling"
+  elif [ -f "/opt/opsling/docker-compose.yml" ]; then
+    OPSLING_DIR=/opt/opsling
+  else
+    OPSLING_DIR=/opt/opsling  # for the error message below
+  fi
+fi
+
+if [ ! -f "${OPSLING_DIR}/docker-compose.yml" ]; then
+  printf 'opsling: docker-compose.yml not found at %s\n' "${OPSLING_DIR}/docker-compose.yml" >&2
+  printf 'tried $HOME/.opsling and /opt/opsling — set OPSLING_DIR if it lives elsewhere\n' >&2
+  exit 1
+fi
+
+compose() {
+  docker compose -f "${OPSLING_DIR}/docker-compose.yml" "$@"
+}
+
+usage() {
+  cat <<'EOF'
+opsling — manage the Opsling service
+
+Usage: opsling <command> [args]
+
+Lifecycle:
+  status, ps        Show container status
+  logs [-f]         Tail container logs
+  restart           Restart the container
+  stop              Stop the container
+  start             Start the container
+  up                Create + start (detached)
+  down              Stop and remove the container
+  pull              Pull the latest image
+  update            pull + up -d  (upgrade in place)
+  health            Show /health endpoint output
+  version           Show the running image tag
+
+Configuration:
+  set KEY VALUE     Set an env var in .env  (run "restart" afterwards)
+  get KEY           Show an env var's value (tokens are redacted)
+  config, edit      Open .env in $EDITOR (default: vi)
+
+Other:
+  uninstall         Stop, remove the container, delete the install dir
+  help              Show this help
+
+Env vars:
+  OPSLING_DIR        Install directory (auto-detected: $HOME/.opsling
+                     for user installs, /opt/opsling for root installs)
+  OPSLING_HEALTH_URL Health endpoint (default: http://127.0.0.1:4717/health)
+
+Examples:
+  opsling set CPU_THRESHOLD 90
+  opsling set TELEGRAM_BOT_TOKEN "$(cat ~/secrets/bot-token)"
+  opsling get DISK_THRESHOLD
+  opsling restart                    # apply config changes
+EOF
+}
+
+confirm() {
+  printf '%s [y/N] ' "$1"
+  IFS= read -r answer || answer=''
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  status|ps)
+    compose ps
+    ;;
+  logs)
+    compose logs "$@"
+    ;;
+  restart)
+    compose restart "$@"
+    ;;
+  stop)
+    compose stop "$@"
+    ;;
+  start)
+    compose start "$@"
+    ;;
+  up)
+    compose up -d
+    ;;
+  down)
+    compose down
+    ;;
+  pull)
+    compose pull
+    ;;
+  update)
+    compose pull && compose up -d
+    ;;
+  config|edit)
+    "${EDITOR:-vi}" "${OPSLING_DIR}/.env"
+    ;;
+  health)
+    if command -v jq >/dev/null 2>&1; then
+      curl -fsS "$OPSLING_HEALTH_URL" | jq .
+    else
+      curl -fsS "$OPSLING_HEALTH_URL"
+      printf '\n'
+    fi
+    ;;
+  version)
+    compose config 2>/dev/null | grep -E '^\s*image:' | head -1 | awk '{print $2}'
+    ;;
+  set)
+    if [ $# -lt 2 ]; then
+      printf 'usage: opsling set <KEY> <VALUE>\n' >&2
+      exit 1
+    fi
+    key="$1"; shift
+    value="$*"
+    case "$key" in
+      *[!A-Za-z0-9_]*|"")
+        printf 'opsling: invalid key "%s" (use uppercase letters, digits, underscores)\n' "$key" >&2
+        exit 1
+        ;;
+    esac
+    env_file="${OPSLING_DIR}/.env"
+    [ -f "$env_file" ] || { printf 'opsling: %s does not exist\n' "$env_file" >&2; exit 1; }
+    tmp="$(mktemp)"
+    awk -v k="$key" -v v="$value" '
+      BEGIN { set = 0 }
+      $0 ~ "^"k"=" { print k"="v; set = 1; next }
+      { print }
+      END { if (!set) print k"="v }
+    ' "$env_file" > "$tmp" && mv "$tmp" "$env_file"
+    chmod 600 "$env_file"
+    case "$key" in
+      *TOKEN*|*SECRET*|*PASSWORD*|*API_KEY*)
+        printf 'opsling: %s updated (value redacted). run "opsling restart" to apply.\n' "$key"
+        ;;
+      *)
+        printf 'opsling: %s=%s. run "opsling restart" to apply.\n' "$key" "$value"
+        ;;
+    esac
+    ;;
+  get)
+    if [ $# -lt 1 ]; then
+      printf 'usage: opsling get <KEY>\n' >&2
+      exit 1
+    fi
+    key="$1"
+    env_file="${OPSLING_DIR}/.env"
+    line="$(grep "^${key}=" "$env_file" 2>/dev/null | head -1)"
+    if [ -z "$line" ]; then
+      printf '%s is not set\n' "$key"
+      exit 0
+    fi
+    value="${line#*=}"
+    case "$key" in
+      *TOKEN*|*SECRET*|*PASSWORD*|*API_KEY*)
+        if [ -n "$value" ]; then
+          printf '%s=<redacted>\n' "$key"
+        else
+          printf '%s=\n' "$key"
+        fi
+        ;;
+      *)
+        printf '%s=%s\n' "$key" "$value"
+        ;;
+    esac
+    ;;
+  uninstall)
+    printf 'This will stop the container and delete %s\n' "$OPSLING_DIR"
+    if confirm 'Are you sure?'; then
+      compose down || true
+      rm -rf "$OPSLING_DIR"
+      printf 'opsling: uninstalled\n'
+    else
+      printf 'opsling: cancelled\n'
+    fi
+    ;;
+  help|-h|--help|'')
+    usage
+    ;;
+  *)
+    printf 'opsling: unknown command "%s"\n' "$cmd" >&2
+    printf 'run "opsling help" for usage\n' >&2
+    exit 1
+    ;;
+esac

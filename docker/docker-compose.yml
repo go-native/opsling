@@ -1,0 +1,22 @@
+services:
+  opsling:
+    image: ghcr.io/go-native/opsling:latest
+    container_name: opsling
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # tells the disk collector to read mounts via the host bind below
+      HOST_FS_ROOT: /host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # host root, read-only with rslave so host submounts propagate in
+      - /:/host:ro,rslave
+    ports:
+      # health endpoint, bound to loopback only by default
+      - "127.0.0.1:4717:4717"
+    healthcheck:
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:4717/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

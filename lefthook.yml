@@ -1,0 +1,14 @@
+pre-commit:
+  parallel: true
+  commands:
+    biome:
+      glob: '*.{ts,js,json}'
+      run: pnpm exec biome check --write {staged_files} && git add {staged_files}
+    typecheck:
+      glob: '*.ts'
+      run: pnpm typecheck
+
+pre-push:
+  commands:
+    test:
+      run: pnpm test
